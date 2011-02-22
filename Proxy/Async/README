@@ -1,3 +1,0 @@
-An attempt to make a non-blocking proxy which is not dependent on LWP's blcoking
-behavior
-
