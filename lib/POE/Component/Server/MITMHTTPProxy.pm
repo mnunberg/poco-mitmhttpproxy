@@ -19,23 +19,27 @@ use POE::Component::Client::Keepalive;
 
 use POE::Filter::Stackable;
 use POE::Filter::HTTPD;
+use POE::Filter::HTTP::Parser;
 use POE::Filter::Stream;
 
 use HTTP::Request;
 use HTTP::Response;
 use HTTP::Headers;
 use File::Basename qw(dirname);
-use lib "../../../../";
-use Miner::Logger { level => "warn" };
+use Miner::Logger { level => "info" };
 
 use Net::SSLeay;
 use URI;
 use CertOnTheFly;
 use File::Slurp qw(write_file read_file);
 
+use Digest::MD5 qw(md5_hex);
+
 use Data::Dumper;
 
 use POE::Component::Server::MITMHTTPProxy::Client;
+
+my $CERT_ON_THE_FLY = 1;
 
 my $CRLF = "\x0D\x0A";
 
@@ -91,7 +95,7 @@ sub genwheel {
         InputEvent => "client_input",
         ErrorEvent => "client_error",
         FlushedEvent => "sent_to_client",
-        InputFilter => $input_filter || POE::Filter::HTTPD->new(),
+        InputFilter => $input_filter || POE::Filter::HTTP::Parser->new(type => "server"),
         OutputFilter => $output_filter || POE::Filter::HTTPD->new(),
     );
 }
@@ -109,47 +113,71 @@ sub client_input {
     my ($kernel,$heap,$input,$wid) = @_[KERNEL,HEAP,ARG0,ARG1];
     #Get client ID here...
     my $client = $heap->{cs}->client_by_input_wheel_id($wid);
-    
+    log_info(sprintf("Client [%d] %s %s", $client->ID, $input->method, $input->uri));
     $client->orig_request($input);
-    if ($input->content) {
-        log_debug sprintf("Client %d has content (%d bytes) for request:!",
-                          $client->ID, length($input->content))
-    }
     $input = $client->request($input);
     if ($input->method eq 'CONNECT') {
-        ##Send a request for an SSL cert..
-        #my $host = $input->uri;
-        #if (exists $CERTCACHE{$host}) {
-        #    ssl_client_send_200($client);
-        #} else {
-        #    if (!exists $PENDING_CLIENT_IDS{$host}) {
-        #        ssl_request_cert($kernel,$heap,$host);
-        #    }
-        #    ssl_add_pending_client($client->ID, $host);
-        #}
+        my $pending = $client->client_wheel->get_input_filter->get_pending();
+        if ($input->content || $pending) {
+            die "GOT PENDING DATA/CONTENT on a CONNECT request";
+        }
+        if ($CERT_ON_THE_FLY) {
+            #Send a request for an SSL cert..
+            my $host = $input->uri;
+            if (exists $CERTCACHE{$host}) {
+                ssl_client_send_200($client);
+            } else {
+                if (!exists $PENDING_CLIENT_IDS{$host}) {
+                    ssl_request_cert($kernel,$heap,$host);
+                }
+                ssl_add_pending_client($client->ID, $host);
+            }
+        } else {
+            ssl_client_send_200($client);
+        }
+        
         if ($client->is_CONNECTed) {
             die "CONNECTed client sending CONNECT again!";
         }
-        ssl_client_send_200($client);
     }
     else {
-        $input->headers->remove_header("Connection");
+        $input->header("Connection" => "close");
         $input->protocol("HTTP/1.0");
+        $input->headers->remove_header("Keep-Alive");
         log_debug("Sending request", $input->uri, "for", $client->ID, "to POCO::C::HTTP");
         $kernel->post("__ua", "request", "got_response", $input);
     }
     log_debug("REQUEST", "\n".$input->as_string);
 }
 
+my %content_cache = ();
+
+sub fold {
+    my ($txt,$prefix) = @_;
+    $txt =~ s/(.{75}[\s]*)\s+/$1\n/mg;
+    $txt =~ s/^/$prefix/mg;
+    return $txt;
+}
+
 sub _process_response {
     my ($client,$request,$response) = @_;
-    $response->headers->remove_header("Connection");
+    #$response->headers->remove_header("Connection");
     my $input_wheel = $client->client_wheel();
-    my $log_meth = ($response->code =~ m/^[23]/) ? \&log_debug : \&log_warn;
-    $log_meth->(sprintf("Got response code ( %d ) for <%s>, total length %d bytes",
-                      $response->code,
-                      URI->new($request->uri)->canonical,
-                      length($response->as_string)));
+    my $log_meth = ($response->code =~ m/^[23]/) ? \&log_info : \&log_warn;
+    my $cksm = md5_hex($response->content);
+    $log_meth->(sprintf("Client [%d] %d %s <%s>, content checksum %s",
+                        $client->ID,
+                        $response->code,
+                        $response->message,
+                        URI->new($request->uri)->canonical,
+                        $cksm));
+    if ($response->code !~ m/^[23]/) {
+        log_info("\n" . fold($client->ID, $response->as_string));
+        log_info("Request was...\n" . fold($client->ID, $request->as_string));
+    }
+    if($content_cache{$cksm}++ > 1) {
+        log_debug("\tContent has been delivered $content_cache{$cksm} times");
+    }
     $input_wheel->put($response);
     $client->is_done(1);
 
@@ -193,15 +221,21 @@ sub sent_to_client {
     my $input = $client->request;
     if ($input->method eq 'CONNECT') {
         my $host = $input->uri;
-        #my ($crtfile,$keyfile) = @{$CERTCACHE{$host}}{qw(cert key)};
-        #
-        #if (!($crtfile && $keyfile)) {
-        #    die "Didn't expect to find a host without a cert/key pair";
-        #}
-        #
-        #my $ctx = SSLify_ContextCreate($keyfile, $crtfile);
-        my $sslified_sock = Server_SSLify(
-            $client->client_wheel->get_input_handle); #, $ctx);
+        my $sslified_sock;
+        if ($CERT_ON_THE_FLY) {
+            my ($crtfile,$keyfile) = @{$CERTCACHE{$host}}{qw(cert key)};
+            
+            if (!($crtfile && $keyfile)) {
+                die "Didn't expect to find a host without a cert/key pair";
+            }
+            
+            my $ctx = SSLify_ContextCreate($keyfile, $crtfile);
+            $sslified_sock = Server_SSLify($client->client_wheel->get_input_handle, $ctx);
+        } else {
+            my $sslified_sock = Server_SSLify(
+            $client->client_wheel->get_input_handle);
+        }
+        
         my $input_filter = $client->client_wheel->get_input_filter();
         my $output_filter = $client->client_wheel->get_output_filter();
         $client->client_wheel(undef);
@@ -271,7 +305,7 @@ sub ssl_got_cert_response {
     
     my $client_action = sub {
         my $cb = shift;
-        foreach my $id (@{ $PENDING_CLIENT_IDS{$host} }) {
+        foreach my $id (@{ delete $PENDING_CLIENT_IDS{$host} }) {
             my $client = $heap->{cs}->client_by_id($id);
             if (!$client) {
                 log_warn "Client $id doesn't exist?";

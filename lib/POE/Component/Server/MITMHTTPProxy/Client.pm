@@ -90,7 +90,7 @@ sub request {
             log_info(sprintf("Client ID %d: Mangled URL: %s -> %s",
                              $self->ID, $old_uri, $request->uri));
         }
-        my ($proto_vers) = ($request->protocol =~ m,HTTP/([\d\.]+),);
+        #my ($proto_vers) = ($request->protocol =~ m,HTTP/([\d\.]+),);
         #Strip Connection headers..
         #http://tools.ietf.org/html/rfc2616#section-14.10
         $request->headers->remove_header("Connection") unless $self->is_CONNECTed();
