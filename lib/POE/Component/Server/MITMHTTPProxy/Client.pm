@@ -23,17 +23,18 @@ BEGIN {
 use URI;
 use constant {
     PC_ID                       => 0,
-    PC_CLIENT_WHEEL             => 1,
+    PC_WHEEL             => 1,
     PC_HTTP_REQUEST             => 2,
     PC_ORIG_REQUEST             => 3,
     PC_HTTPS_CONNECTED          => 4,
     PC_DONE                     => 5,
-    _PC_MAX                     => 6,
+    PC_RESPONSE_HEADER_SENT     => 6,
+    _PC_MAX                     => 7,
 };
 
-our $id_counter = 1;
+our $id_counter = 5000;
 our %CLIENT_BY_ID;
-our %CLIENT_BY_INPUT_WHEEL_ID;
+our %CLIENT_BY_WHEEL_ID;
 our %CLIENT_BY_REQUEST;
 
 sub client_by_id {
@@ -43,7 +44,7 @@ sub client_by_id {
 
 sub client_by_input_wheel_id {
     my ($cls,$wid) = @_;
-    return $CLIENT_BY_INPUT_WHEEL_ID{$wid};
+    return $CLIENT_BY_WHEEL_ID{$wid};
 }
 
 sub client_by_request {
@@ -54,25 +55,34 @@ sub client_by_request {
 sub new {
     my ($cls,$input_wheel) = @_;
     my $self = [];
+    bless ($self,$cls);
     foreach my $i (0.._PC_MAX) {
         $self->[$i] = undef;
     }
     $self->[PC_ID] = $id_counter++;
     $CLIENT_BY_ID{$self->[PC_ID]} = $self;
-    bless ($self,$cls);
-    $self->client_wheel($input_wheel);
+    $self->wheel($input_wheel);
+    return $self;
 }
+
 
 sub ID {
     shift->[PC_ID];
 }
-sub client_wheel {
+sub wheel {
     my ($self,$new_wheel) = @_;
     if (@_ == 2) {
-        $self->[PC_CLIENT_WHEEL] = $new_wheel;
-        $CLIENT_BY_INPUT_WHEEL_ID{$new_wheel->ID} = $self if defined $new_wheel;
+        my $old_wheel = $self->[PC_WHEEL];
+        my $action = (defined $new_wheel) ? "Assigning" : "Unsetting";
+        log_debug sprintf("%s wheel %d for client %d",
+                         $action,
+                         $new_wheel ? $new_wheel->ID : $old_wheel ? $old_wheel->ID : -1,
+                         $self->ID);
+        delete $CLIENT_BY_WHEEL_ID{$old_wheel->ID} if $old_wheel;
+        $CLIENT_BY_WHEEL_ID{$new_wheel->ID} = $self if $new_wheel;
+        $self->[PC_WHEEL] = $new_wheel;
     }
-    return $self->[PC_CLIENT_WHEEL];
+    return $self->[PC_WHEEL];
 }
 
 sub request {
@@ -93,6 +103,7 @@ sub request {
         #my ($proto_vers) = ($request->protocol =~ m,HTTP/([\d\.]+),);
         #Strip Connection headers..
         #http://tools.ietf.org/html/rfc2616#section-14.10
+        #Don't strip it if we're CONNECTed (the client doesn't know we're doing this)
         $request->headers->remove_header("Connection") unless $self->is_CONNECTed();
         $self->[PC_HTTP_REQUEST] = $request;
         $CLIENT_BY_REQUEST{$request} = $self;
@@ -125,6 +136,14 @@ sub is_done {
     return $self->[PC_DONE];
 }
 
+sub response_header_sent {
+    my ($self,$val) = @_;
+    if (@_ == 2) {
+        $self->[PC_RESPONSE_HEADER_SENT] = $val;
+    }
+    return $self->[PC_RESPONSE_HEADER_SENT];
+}
+
 sub _delete_by_value {
     my ($val,$hlist) = @_;
     foreach my $h (@$hlist) {
@@ -143,10 +162,10 @@ sub DESTROY {
 sub close {
     my $self = shift;
     _delete_by_value($self,
-        [\%CLIENT_BY_REQUEST, \%CLIENT_BY_INPUT_WHEEL_ID,
+        [\%CLIENT_BY_REQUEST, \%CLIENT_BY_WHEEL_ID,
         \%CLIENT_BY_ID]);
-    log_info sprintf("Removing client (id=%d url=%s)",
-                     $self->ID, $self->request->uri);
+    log_debug sprintf("Removing client (id=%d url=%s)",
+                     $self->ID, $self->request ? $self->request->uri : "<GOT NO REQUEST>");
 }
 
 1;
