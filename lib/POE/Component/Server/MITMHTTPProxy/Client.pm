@@ -1,25 +1,8 @@
 package POE::Component::Server::MITMHTTPProxy::Client;
 use strict;
 use warnings;
-BEGIN {
-    use File::Basename qw(dirname);
-    my $base = dirname(__FILE__);
-    require "lib.pm";
-    lib->import($base);
-    eval {
-    require "Miner/Logger.pm";
-    };
-    if ($@) {
-        no strict "refs";
-        foreach my $lvl qw(debug err warn crit info) {
-            *{"log_".$lvl} = sub {
-                print join(" ", @_) . "\n";
-            };
-        }
-    } else {
-        Miner::Logger->import({level => "warn"});
-    }
-}
+use Log::Fu { level => "warn" };
+
 use URI;
 use constant {
     PC_ID                       => 0,
@@ -29,7 +12,8 @@ use constant {
     PC_HTTPS_CONNECTED          => 4,
     PC_DONE                     => 5,
     PC_RESPONSE_HEADER_SENT     => 6,
-    _PC_MAX                     => 7,
+    PC_REQUEST_COUNT            => 7,
+    _PC_MAX                     => 8,
 };
 
 our $id_counter = 5000;
@@ -134,6 +118,14 @@ sub is_done {
         $self->[PC_DONE] = $val;
     }
     return $self->[PC_DONE];
+}
+
+sub request_count {
+    my ($self,%opts) = @_;
+    if ($opts{incr}) {
+        $self->[PC_REQUEST_COUNT]++;
+    }
+    return $self->[PC_REQUEST_COUNT];
 }
 
 sub response_header_sent {
