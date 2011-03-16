@@ -27,6 +27,7 @@ use POE::Component::Server::MITMHTTPProxy::Constants qw(:callback_retvals);
 
 our $STREAMING = 4096;
 our $UA_ALIAS = "mitmproxy-ua";
+our $UA_CERTFETCH_ALIAS = "mitmproxy-certfetch-ua";
 our $PROXY_ALIAS = "mitmproxy-proxy";
 #CA object...
 our $CA;
@@ -40,7 +41,8 @@ my $CRLF = "\x0D\x0A";
 sub spawn {
     my ($cls,%opts) = @_;
     my $ua_alias = delete $opts{UAAlias} || $UA_ALIAS;
-    my $ua_already_exists = delete $opts{NewUA};
+	my $need_new_ua = delete $opts{NewUA};
+	$need_new_ua = 1 if (!defined $need_new_ua);
     my $proxy_alias = delete $opts{ProxyAlias} || $PROXY_ALIAS;
     my $streaming = delete $opts{Streaming} || $STREAMING;
     my $listen_addr = delete $opts{ProxyBindAddress} || "127.0.0.1";
@@ -49,7 +51,7 @@ sub spawn {
     my $sslstuff_path = delete $opts{CertificatePath};
     my $ca_cert = delete $opts{ServerCert};
     my $ca_key = delete $opts{ServerKey};
-    
+    my $cm = delete $opts{ConnectionManager};
     my $u_events = delete $opts{UserEvents};
     my $u_session = delete $opts{UserSession};
     
@@ -91,6 +93,7 @@ sub spawn {
         ] ],
         heap => {
             ua_alias => $ua_alias,
+            ua_certfetch_alias => $UA_CERTFETCH_ALIAS,
             streaming => $streaming,
             cs => "POE::Component::Server::MITMHTTPProxy::Client",
             CERT_CLONER => $sslstuff_path,
@@ -98,9 +101,9 @@ sub spawn {
                 $u_events, $u_session)
         },
     );
-    
-    if (!$ua_already_exists) {
-        my $cm = POE::Component::Client::Keepalive->new(
+    if ($need_new_ua) {
+        log_debug("Creating new UA ($ua_alias)");
+        $cm = POE::Component::Client::Keepalive->new(
             max_per_host => 32,
             max_open => 512,
             #timeout => 3,
@@ -117,6 +120,18 @@ sub spawn {
         }
         POE::Component::Client::HTTP->spawn(%ua_opts);
     }
+    if (!$cm) {
+        die "Must have connection manager specified for sanity if a new UA \n".
+        "is being passed to the spawn() initialization function";
+    }
+    
+    POE::Component::Client::HTTP->spawn(
+        Alias => $UA_CERTFETCH_ALIAS,
+        FollowRedirects => 0,
+        Streaming => 0,
+        Timeout => 10,
+        ConnectionManager => $cm
+    );
     
     if (!$sslstuff_path) {
         if (!($ca_key && $ca_cert)) {
@@ -275,7 +290,9 @@ sub user_response {
         $heap->{dispatcher}->error($request, "Couldn't find client for request");
         return;
     }
-    _process_user_response($kernel,$heap,$request,$response,$client);
+    my ($real_response,$streaming,$data) = @$response;
+    send_response($kernel,$heap,$request,$real_response,$client,
+                  streaming => $streaming, data => $data);
 }
 
 sub send_response {
@@ -409,14 +426,14 @@ sub ssl_client_send_200 {
 
 sub ssl_request_cert {
     my ($kernel,$heap,$host) = @_;
-    log_debug("Trying to send dummy request for $host");
+    log_warn("Trying to send dummy request for $host");
     my $uri = URI->new();
     $uri->scheme("https");
     $uri->host($host);
-    log_debug("Using URI", $uri->as_string());
-    my $request = HTTP::Request->new(HEAD => $uri);
+    log_warn("Using URI", $uri->as_string());
+    my $request = HTTP::Request->new(HEAD => $uri->canonical()->as_string());
     $request->header('X-For-Host' => $host);
-    $kernel->post($heap->{ua_alias}, "request", "ssl_got_cert_response", $request);
+    $kernel->post($heap->{ua_certfetch_alias}, "request", "ssl_got_cert_response", $request);
 }
 
 sub ssl_add_pending_client {
@@ -447,8 +464,7 @@ sub ssl_got_cert_response {
     };
     
     if (!$pem) {
-        log_err("SOMETHING HAPPEN!");
-        print Dumper($response->[0]);
+        log_err("SOMETHING HAPPEN!\n".Dumper($response->[0]));
         my $new_response = HTTP::Response->new(502, "Couldn't fetch spoofed cert");
         $client_action->(
             sub {
